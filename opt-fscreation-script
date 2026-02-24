@@ -1,0 +1,390 @@
+If already created appbin but symlinc is not created follow below steps:
+service taniumclient status
+service taniumclient stop
+mv /opt/Tanium /appbin/Tanium -f
+ln -s /appbin/Tanium /opt/Tanium
+service taniumclient restart
+
+==================================
+echo 1>/sys/class/block/sdc/device/rescan   --replace with diskname  --> it will scan the existing disk
+======================
+To create appbin-script:
+======================
+
+Once VMware team add 20GB and confirm.
+ check if Tanium is running , stop it:
+$service taniumclient status
+$service taniumclient stop
+
+Login to server
+ 
+STEP 1 stop taniumclient service
+ 
+STEP 2 vim taniumtest1.sh
+ 
+#####################################
+#!/bin/bash
+ 
+# Desired disk size in GB
+DESIRED_SIZE=20
+ 
+# Mount point
+MOUNT_POINT="/appbin"
+ 
+# LVM names
+VG_NAME="appbin_tanium_vg"
+LV_NAME="appbin_tanium_lv"
+LV_SIZE="20G"  # Size of the Logical Volume (20GB)
+ 
+ 
+# Step 1: Find the raw 20GB disk
+RAW_DISK=$(lsblk -d -n -o NAME,SIZE,TYPE | awk -v size="$DESIRED_SIZE"G '$2 == size && $3 == "disk" {print $1}')
+ 
+# Check if a raw 20GB disk is found
+if [ -z "$RAW_DISK" ]; then
+   echo "No raw 20GB disk found."
+   exit 1
+fi
+ 
+# Step 2: Ensure the disk is unformatted (no partitions)
+for disk in $RAW_DISK; do
+   PARTITIONS=$(lsblk -f | grep $disk | awk {'print $2'} )  # Exclude the disk itself
+ 
+   if [ -z "$PARTITIONS" ]; then
+       echo "Found raw 20GB disk: /dev/$disk"
+   else
+       echo "Disk /dev/$disk has partitions or is not raw. Skipping."
+       continue
+   fi
+ 
+   # Step 3: Create a Physical Volume (PV)
+   echo "Creating Physical Volume (PV) on /dev/$disk..."
+   pvcreate "/dev/$disk"
+ 
+   # Step 4: Create a Volume Group (VG)
+   echo "Creating Volume Group $VG_NAME..."
+   vgcreate "$VG_NAME" "/dev/$disk"
+ 
+   # Step 5: Create a Logical Volume (LV) with 20GB
+   echo "Creating Logical Volume $LV_NAME with size $LV_SIZE..."
+   lvcreate -l 100%FREE -n "$LV_NAME" --wipesignatures y --yes --zero y "$VG_NAME"
+ 
+   # Step 6: Create a filesystem (ext4) on the logical volume
+   echo "Creating ext4 filesystem on /dev/$VG_NAME/$LV_NAME..."
+   mkfs.ext4 "/dev/$VG_NAME/$LV_NAME"
+ 
+   # Step 7: Create mount point if it doesn't exist
+   if [ ! -d "$MOUNT_POINT" ]; then
+       echo "Creating mount point at $MOUNT_POINT..."
+       mkdir -p "$MOUNT_POINT"
+   fi
+ 
+   # Step 8: Mount the logical volume
+
+   echo "Mounting /dev/$VG_NAME/$LV_NAME to $MOUNT_POINT..."
+   mount "/dev/$VG_NAME/$LV_NAME" "$MOUNT_POINT"
+ 
+   # Step 9: Verify that the disk is mounted
+   if mount | grep -q "$MOUNT_POINT"; then
+       echo "Disk successfully mounted at $MOUNT_POINT."
+   else
+       echo "Error: Failed to mount the disk."
+       exit 1
+   fi
+ 
+   # Step 10: Add the mount entry to /etc/fstab for persistence across reboots
+   echo "Adding the mount entry to /etc/fstab..."
+   echo "/dev/$VG_NAME/$LV_NAME $MOUNT_POINT ext4 defaults 0 0" >> /etc/fstab
+ 
+   echo "Disk setup complete and mounted at $MOUNT_POINT!"
+   exit 2
+done
+##############END OF THIS SCRIPT################
+ 
+STEP 3 vim taniumtest2.sh
+ 
+###########START OF SCRIPT#########
+#!/bin/bash
+ 
+# Source and destination directories
+SOURCE_DIR="/opt/Tanium"
+DEST_DIR="/appbin"
+DEST_SYMDIR="/appbin/Tanium"
+SERVICE_NAME="taniumclient"
+ 
+# Function to move the directory and create symlink
+move_directory_and_create_symlink() {
+    # Check if the source directory exists
+    if [ ! -d "$SOURCE_DIR" ]; then
+        echo "Source directory $SOURCE_DIR does not exist. Exiting."
+        exit 1
+    fi
+ 
+    # Moving the directory
+    echo "Moving $SOURCE_DIR to $DEST_DIR..."
+    mv -f "$SOURCE_DIR" "$DEST_DIR" &
+    wait
+ 
+    # Check if the destination directory exists
+    if [ -d "$DEST_SYMDIR" ]; then
+        # Create a symlink after the move is confirmed complete
+        echo "Move successful. Creating symlink from $DEST_SYMDIR to $SOURCE_DIR..."
+        ln -s "$DEST_SYMDIR" "$SOURCE_DIR"
+        echo "Symlink created successfully."
+    else
+        echo "Failed to move the directory. Symlink will not be created."
+        exit 1
+    fi
+}
+ 
+# Function to restart the Tanium service
+restart_tanium_service() {
+    echo "Restarting $SERVICE_NAME..."
+ 
+    # Detect the OS and version
+    if [ -f /etc/redhat-release ]; then
+        os_version=$(cat /etc/redhat-release)
+ 
+        if grep -q "release 6" <<< "$os_version"; then
+            echo "Detected RHEL 6. Using 'service' command to start the service."
+            service TaniumClient start
+        elif grep -q -E "release [7-9]|release 1[0-9]" <<< "$os_version"; then
+            echo "Detected RHEL 7 or above. Using 'systemctl' command to start the service."
+            systemctl start "$SERVICE_NAME.service"
+        else
+            echo "Unsupported RHEL version: $os_version"
+            exit 1
+        fi
+    elif [ -f /etc/os-release ]; then
+        . /etc/os-release
+ 
+        if [[ "$ID" == "ubuntu" ]]; then
+            # Check Ubuntu version
+            ubuntu_version=${VERSION_ID//./} # Remove dot for numeric comparison
+            if [[ "$ubuntu_version" -lt 1804 ]]; then
+                echo "Detected Ubuntu version below 18.04. Using 'service' command to start the service."
+                service "$SERVICE_NAME" start
+            else
+                echo "Detected Ubuntu version 18.04 or above. Using 'systemctl' command to start the service."
+                systemctl start "$SERVICE_NAME"
+            fi
+        elif [[ "$ID" == "sles" || "$ID" == "opensuse" ]]; then
+            echo "Detected SUSE Linux. Using 'systemctl' command to start the service."
+            systemctl start "$SERVICE_NAME"
+        else
+            echo "Unsupported OS: $NAME"
+            exit 1
+        fi
+    else
+        echo "Unsupported operating system."
+        exit 1
+    fi
+ 
+    # Check if the service started successfully
+    if [ $? -eq 0 ]; then
+        echo "Service $SERVICE_NAME started successfully."
+    else
+        echo "Failed to start the service $SERVICE_NAME."
+        exit 1
+    fi
+}
+ 
+# Main script execution
+move_directory_and_create_symlink
+restart_tanium_service
+echo "Tanium service and directory management completed successfully."
+df -h /appbin
+ls -ltr /opt
+##############END OF THIS SCRIPT################
+ 
+STEP 4 Run these scripts
+bash -x taniumtest1.sh
+bash -x taniumtest2.sh
+ 
+STEP 5 Confirm if taniumclient server started back running 
+
+
+
+============================
+
+
+
+[root@by-abcd opt]$ systemctl status taniumclient
+● taniumclient.service - Tanium Client
+   Loaded: loaded (/lib/systemd/system/taniumclient.service; enabled; vendor preset: enabled)
+   Active: active (running) since Thu 2025-08-07 14:35:46 CEST; 1h 1min ago
+  Process: 44390 ExecStop=/bin/kill -s TERM $MAINPID (code=exited, status=0/SUCCESS)
+ Main PID: 61065 (TaniumClient)
+   CGroup: /system.slice/taniumclient.service
+           ├─61065 /opt/Tanium/TaniumClient/TaniumClient -d
+           ├─61079 /opt/Tanium/TaniumClient/TaniumClient -c
+           ├─61089 /opt/Tanium/TaniumClient/TaniumCX run-framework
+           ├─61116 /opt/Tanium/TaniumClient/TaniumCX_ssl1 run --purpose libTaniumTSDB.so
+           ├─61133 /opt/Tanium/TaniumClient/TaniumCX run --purpose libTaniumConfig.so
+           ├─61144 /opt/Tanium/TaniumClient/TaniumCX run --purpose libSupportCX.so
+           └─61155 /opt/Tanium/TaniumClient/TaniumCX_ssl1 run --purpose libTaniumDiscover.so
+
+Aug 07 14:35:46 by-abcd systemd[1]: Started Tanium Client.
+[root@by-abcd opt]$ systemctl stop taniumclient
+[root@byabcd opt]$ vim taniumtest1.sh
+[root@by-abcd opt]$  vim taniumtest2.sh
+        
+
+[root@byabcd opt]$ bash -x taniumtest1.sh
++ DESIRED_SIZE=20
++ MOUNT_POINT=/appbin
++ VG_NAME=appbin_tanium_vg
++ LV_NAME=appbin_tanium_lv
++ LV_SIZE=20G
+++ lsblk -d -n -o NAME,SIZE,TYPE
+++ awk -v size=20G '$2 == size && $3 == "disk" {print $1}'
++ RAW_DISK='sda
+sdb
+sdc'
++ '[' -z 'sda
+sdb
+sdc' ']'
++ for disk in '$RAW_DISK'
+++ lsblk -f
+++ grep sda
+++ awk '{print $2}'
++ PARTITIONS='
+ext3
+
+LVM2_member'
++ '[' -z '
+ext3
+
+LVM2_member' ']'
++ echo 'Disk /dev/sda has partitions or is not raw. Skipping.'
+Disk /dev/sda has partitions or is not raw. Skipping.
++ continue
++ for disk in '$RAW_DISK'
+++ lsblk -f
+++ grep sdb
+++ awk '{print $2}'
++ PARTITIONS=LVM2_member
++ '[' -z LVM2_member ']'
++ echo 'Disk /dev/sdb has partitions or is not raw. Skipping.'
+Disk /dev/sdb has partitions or is not raw. Skipping.
++ continue
++ for disk in '$RAW_DISK'
+++ lsblk -f
+++ grep sdc
+++ awk '{print $2}'
++ PARTITIONS=
++ '[' -z '' ']'
++ echo 'Found raw 20GB disk: /dev/sdc'
+Found raw 20GB disk: /dev/sdc
++ echo 'Creating Physical Volume (PV) on /dev/sdc...'
+Creating Physical Volume (PV) on /dev/sdc...
++ pvcreate /dev/sdc
+  Physical volume "/dev/sdc" successfully created
++ echo 'Creating Volume Group appbin_tanium_vg...'
+Creating Volume Group appbin_tanium_vg...
++ vgcreate appbin_tanium_vg /dev/sdc
+  Volume group "appbin_tanium_vg" successfully created
++ echo 'Creating Logical Volume appbin_tanium_lv with size 20G...'
+Creating Logical Volume appbin_tanium_lv with size 20G...
++ lvcreate -l 100%FREE -n appbin_tanium_lv --wipesignatures y --yes --zero y appbin_tanium_vg
+  Logical volume "appbin_tanium_lv" created.
++ echo 'Creating ext4 filesystem on /dev/appbin_tanium_vg/appbin_tanium_lv...'
+Creating ext4 filesystem on /dev/appbin_tanium_vg/appbin_tanium_lv...
++ mkfs.ext4 /dev/appbin_tanium_vg/appbin_tanium_lv
+mke2fs 1.42.13 (17-May-2015)
+Creating filesystem with 5241856 4k blocks and 1310720 inodes
+Filesystem UUID: e8f969f6-3de3-420e-9326-49c885e78920
+Superblock backups stored on blocks:
+        32768, 98304, 163840, 229376, 294912, 819200, 884736, 1605632, 2654208,
+        4096000
+
+Allocating group tables: done
+Writing inode tables: done
+Creating journal (32768 blocks): done
+Writing superblocks and filesystem accounting information: done
+
++ '[' '!' -d /appbin ']'
++ echo 'Creating mount point at /appbin...'
+Creating mount point at /appbin...
++ mkdir -p /appbin
++ echo 'Mounting /dev/appbin_tanium_vg/appbin_tanium_lv to /appbin...'
+Mounting /dev/appbin_tanium_vg/appbin_tanium_lv to /appbin...
++ mount /dev/appbin_tanium_vg/appbin_tanium_lv /appbin
++ mount
++ grep -q /appbin
++ echo 'Disk successfully mounted at /appbin.'
+Disk successfully mounted at /appbin.
++ echo 'Adding the mount entry to /etc/fstab...'
+Adding the mount entry to /etc/fstab...
++ echo '/dev/appbin_tanium_vg/appbin_tanium_lv /appbin ext4 defaults 0 0'
++ echo 'Disk setup complete and mounted at /appbin!'
+Disk setup complete and mounted at /appbin!
++ exit 2
+[root@by-abcd opt]$ bash -x taniumtest2.sh
++ SOURCE_DIR=/opt/Tanium
++ DEST_DIR=/appbin
++ DEST_SYMDIR=/appbin/Tanium
++ SERVICE_NAME=taniumclient
++ move_directory_and_create_symlink
++ '[' '!' -d /opt/Tanium ']'
++ echo 'Moving /opt/Tanium to /appbin...'
+Moving /opt/Tanium to /appbin...
++ wait
++ mv -f /opt/Tanium /appbin
++ '[' -d /appbin/Tanium ']'
++ echo 'Move successful. Creating symlink from /appbin/Tanium to /opt/Tanium...'
+Move successful. Creating symlink from /appbin/Tanium to /opt/Tanium...
++ ln -s /appbin/Tanium /opt/Tanium
++ echo 'Symlink created successfully.'
+Symlink created successfully.
++ restart_tanium_service
++ echo 'Restarting taniumclient...'
+Restarting taniumclient...
++ '[' -f /etc/redhat-release ']'
++ '[' -f /etc/os-release ']'
++ . /etc/os-release
+++ NAME=Ubuntu
+++ VERSION='16.04.7 LTS (Xenial Xerus)'
+++ ID=ubuntu
+++ ID_LIKE=debian
+++ PRETTY_NAME='Ubuntu 16.04.7 LTS'
+++ VERSION_ID=16.04
+++ HOME_URL=http://www.ubuntu.com/
+++ SUPPORT_URL=http://help.ubuntu.com/
+++ BUG_REPORT_URL=http://bugs.launchpad.net/ubuntu/
+++ VERSION_CODENAME=xenial
+++ UBUNTU_CODENAME=xenial
++ [[ ubuntu == \u\b\u\n\t\u ]]
++ ubuntu_version=1604
++ [[ 1604 -lt 1804 ]]
++ echo 'Detected Ubuntu version below 18.04. Using '\''service'\'' command to start the service.'
+Detected Ubuntu version below 18.04. Using 'service' command to start the service.
++ service taniumclient start
++ '[' 0 -eq 0 ']'
++ echo 'Service taniumclient started successfully.'
+Service taniumclient started successfully.
++ echo 'Tanium service and directory management completed successfully.'
+Tanium service and directory management completed successfully.
++ df -h /appbin
+Filesystem                                     Size  Used Avail Use% Mounted on
+/dev/mapper/appbin_tanium_vg-appbin_tanium_lv   20G  520M   19G   3% /appbin
++ ll /opt
+taniumtest2.sh: line 91: ll: command not found
+[root@byabcd opt]$ systemctl status taniumclient
+● taniumclient.service - Tanium Client
+   Loaded: loaded (/lib/systemd/system/taniumclient.service; enabled; vendor preset: enabled)
+   Active: active (running) since Thu 2025-08-07 15:40:31 CEST; 11s ago
+  Process: 59816 ExecStop=/bin/kill -s TERM $MAINPID (code=exited, status=0/SUCCESS)
+ Main PID: 61183 (TaniumClient)
+   CGroup: /system.slice/taniumclient.service
+           ├─61183 /opt/Tanium/TaniumClient/TaniumClient -d
+           ├─61197 /appbin/Tanium/TaniumClient/TaniumClient -c
+           ├─61203 /appbin/Tanium/TaniumClient/TaniumCX run-framework
+           ├─61224 /appbin/Tanium/TaniumClient/TaniumCX_ssl1 run --purpose libTaniumDiscover.so
+           ├─61238 /appbin/Tanium/TaniumClient/TaniumCX run --purpose libSupportCX.so
+           ├─61250 /appbin/Tanium/TaniumClient/TaniumCX_ssl1 run --purpose libTaniumTSDB.so
+           └─61272 /appbin/Tanium/TaniumClient/TaniumCX run --purpose libTaniumConfig.so
+
+Aug 07 15:40:31 by-abcd systemd[1]: Started Tanium Client.
+[root@byabcd opt]$
+
